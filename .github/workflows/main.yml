@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101114">
+  <meta name="description"
+        content="Ferramenta para identificar e-mails publicados em bios públicas do TikTok.">
+  <title>ExtNoBrasil | OSINT Email Hunter</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark">EN</div>
+    <div>
+      <strong>ExtNoBrasil</strong>
+      <p>OSINT EMAIL HUNTER</p>
+    </div>
+    <span class="version">BETA</span>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow">PUBLIC PROFILE ANALYSIS</div>
+      <h1>Encontre contatos <span>públicos</span></h1>
+      <p>
+        Analise uma bio pública do TikTok e identifique
+        os endereços de e-mail que aparecem explicitamente nela.
+      </p>
+    </section>
+
+    <section class="panel">
+      <form id="hunter-form">
+        <label for="username">Username do TikTok</label>
+        <div class="username-input">
+          <span>@</span>
+          <input
+            id="username"
+            name="username"
+            type="text"
+            placeholder="marlon_sander_2026"
+            maxlength="24"
+            pattern="[A-Za-z0-9._]+"
+            required
+          >
+        </div>
+
+        <label for="bio">Bio pública do perfil</label>
+        <textarea
+          id="bio"
+          name="bio"
+          rows="4"
+          maxlength="2000"
+          placeholder="Cole aqui a bio pública do perfil..."
+          required
+        ></textarea>
+
+        <p class="hint">
+          A página não consegue ler diretamente todos os perfis do TikTok.
+          Copie a bio que está visível publicamente e cole no campo acima.
+        </p>
+
+        <button type="submit" id="analyze-button">
+          Analisar bio pública
+        </button>
+      </form>
+    </section>
+
+    <section id="results" class="panel results" hidden aria-live="polite">
+      <div class="result-heading">
+        <div>
+          <div class="eyebrow">RELATÓRIO</div>
+          <h2 id="result-title">Resultado da análise</h2>
+        </div>
+        <span class="status">CONCLUÍDO</span>
+      </div>
+
+      <div class="data-row">
+        <span>Perfil informado</span>
+        <strong id="result-username"></strong>
+      </div>
+
+      <div class="data-row">
+        <span>E-mails na bio</span>
+        <strong id="result-count">0</strong>
+      </div>
+
+      <div id="email-list" class="email-list"></div>
+
+      <div class="bio-preview">
+        <h3>Bio analisada</h3>
+        <p id="result-bio"></p>
+      </div>
+
+      <button type="button" id="copy-button" class="secondary" hidden>
+        Copiar e-mails
+      </button>
+
+      <p id="copy-status" class="hint" role="status"></p>
+    </section>
+
+    <section class="notice">
+      <strong>Limites e privacidade</strong>
+      <p>
+        Esta ferramenta só identifica e-mails escritos no texto fornecido.
+        Não descobre e-mails privados, não verifica caixas postais e não
+        confirma que um endereço esteja ativo.
+      </p>
+      <p>
+        A bio é processada localmente no navegador. Não é enviada para
+        um servidor por este projeto.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <p>ExtNoBrasil · OSINT Email Hunter · Projeto comunitário</p>
+  </footer>
+</body>
+</html>
