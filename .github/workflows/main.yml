@@ -1,5 +1,5 @@
 
-name: ExtNoBrasil PC Virtual - Garuda KDE + XRDP
+name: "ExtNoBrasil PC Virtual - Windows 11"
 
 on:
   workflow_dispatch:
@@ -7,139 +7,242 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: extnobrasil-pc-virtual
+  cancel-in-progress: false
+
 jobs:
-  garuda-pc:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
+  prepare-vm:
+    name: Preparar ambiente Windows 11 QEMU
+    runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
-      - name: Preparar QEMU e ferramentas
-        shell: bash
+      - name: Exibir informações reais do runner
+        shell: pwsh
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            openssh-client \
-            curl \
-            procps \
-            iproute2
+          $ErrorActionPreference = "Stop"
 
-          mkdir -p "$HOME/garuda-vm"
+          Write-Host "========================================"
+          Write-Host " ExtNoBrasil PC Virtual [BETA]"
+          Write-Host " Criador - ExtNoBrasil (ExT)"
+          Write-Host "========================================"
 
-      - name: Baixar imagem QCOW2 do Garuda
-        env:
-          IMAGE_URL: ${{ secrets.GARUDA_QCOW2_URL }}
-        shell: bash
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture,
+              @{N="RAM_Total_GB";E={[math]::Round($_.TotalVisibleMemorySize / 1MB, 2)}} |
+            Format-List
+
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores,
+              NumberOfLogicalProcessors |
+            Format-List
+
+          Get-PSDrive -Name C |
+            Select-Object Name,
+              @{N="Livre_GB";E={[math]::Round($_.Free / 1GB, 2)}} |
+            Format-List
+
+          Write-Host "Os dados acima descrevem o runner, não a VM."
+
+      - name: Verificar espaço disponível
+        shell: pwsh
         run: |
-          set -euo pipefail
+          $free = (Get-PSDrive C).Free / 1GB
+          Write-Host "Espaço livre: $([math]::Round($free, 2)) GB"
 
-          if [ -z "${IMAGE_URL:-}" ]; then
-            echo "::error::Configure o segredo GARUDA_QCOW2_URL com a URL direta da imagem QCOW2."
-            exit 1
-          fi
+          if ($free -lt 25) {
+            throw "Espaço insuficiente para tentar baixar e preparar a ISO."
+          }
 
-          curl --fail --location --retry 3 \
-            "$IMAGE_URL" \
-            --output "$HOME/garuda-vm/garuda.qcow2"
-
-          qemu-img info "$HOME/garuda-vm/garuda.qcow2"
-
-          FORMAT="$(qemu-img info --output=json \
-            "$HOME/garuda-vm/garuda.qcow2" |
-            python3 -c 'import json,sys; print(json.load(sys.stdin)["format"])')"
-
-          if [ "$FORMAT" != "qcow2" ]; then
-            echo "::error::O arquivo baixado não é uma imagem QCOW2."
-            exit 1
-          fi
-
-      - name: Configurar disco virtual de 80 GB
-        shell: bash
+      - name: Tentar obter URL da ISO oficial da Microsoft
+        id: iso
+        shell: pwsh
         run: |
-          set -euo pipefail
-          cd "$HOME/garuda-vm"
+          $ErrorActionPreference = "Stop"
+          $page = "https://www.microsoft.com/pt-br/software-download/windows11"
 
-          qemu-img resize garuda.qcow2 80G
+          Write-Host "Consultando a página oficial da Microsoft..."
+          $response = Invoke-WebRequest `
+            -Uri $page `
+            -UseBasicParsing `
+            -Headers @{
+              "User-Agent" = "Mozilla/5.0"
+              "Accept-Language" = "pt-BR,pt;q=0.9,en;q=0.8"
+            }
 
-          echo "Disco virtual configurado para até 80 GB."
-          echo "O espaço físico disponível continua limitado pelo runner."
+          $html = $response.Content
 
-      - name: Verificar recursos disponíveis
-        shell: bash
+          # Só aceita candidatos do domínio de download da Microsoft.
+          $matches = [regex]::Matches(
+            $html,
+            '(?i)https://software\.download\.prss\.microsoft\.com/[^"''\s<>\\]+'
+          )
+
+          $candidate = $null
+
+          foreach ($match in $matches) {
+            $url = [System.Net.WebUtility]::HtmlDecode($match.Value)
+            $url = $url -replace '\\u0026', '&' -replace '&amp;', '&'
+
+            if ($url -match '(?i)\.iso([?&]|$)') {
+              $candidate = $url
+              break
+            }
+          }
+
+          if (-not $candidate) {
+            throw @"
+          A página oficial não revelou uma URL direta da ISO nesta consulta.
+          A Microsoft pode exigir a seleção da edição e do idioma por um fluxo
+          dinâmico. O workflow não usará fontes de terceiros nem inventará URLs.
+          Abra a página oficial:
+          https://www.microsoft.com/pt-br/software-download/windows11
+          "@
+          }
+
+          if ($candidate -notmatch '^https://software\.download\.prss\.microsoft\.com/') {
+            throw "A URL não passou na validação do domínio."
+          }
+
+          "WINDOWS_ISO_URL=$candidate" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "URL oficial candidata encontrada."
+          Write-Host "O link pode expirar; será validado no download."
+
+      - name: Instalar QEMU
+        shell: pwsh
         run: |
-          echo "===== ExtNoBrasil PC Virtual ====="
-          echo "Sistema convidado: Garuda Linux KDE"
-          echo "vCPU configuradas: 4"
-          echo "RAM da VM: 4096 MB"
-          echo "Disco virtual: 80 GB"
-          echo "GPU: adaptador virtual QEMU"
-          echo "Aceleração KVM:"
-          if [ -e /dev/kvm ]; then
-            echo "Dispositivo KVM disponível."
-          else
-            echo "KVM indisponível; QEMU pode usar emulação por software."
-          fi
-          free -h
-          df -h "$HOME"
+          $ErrorActionPreference = "Stop"
 
-      - name: Iniciar Garuda e encaminhar XRDP
-        shell: bash
+          if (-not (Get-Command qemu-img.exe -ErrorAction SilentlyContinue)) {
+            choco install qemu -y --no-progress
+          }
+
+          $qemuImg = Get-Command qemu-img.exe -ErrorAction SilentlyContinue
+
+          if (-not $qemuImg) {
+            $possible = @(
+              "C:\Program Files\qemu\qemu-img.exe",
+              "C:\Program Files\QEMU\qemu-img.exe"
+            )
+
+            foreach ($path in $possible) {
+              if (Test-Path $path) {
+                $qemuImg = Get-Item $path
+                break
+              }
+            }
+          }
+
+          if (-not $qemuImg) {
+            throw "Não foi possível localizar qemu-img.exe após a instalação."
+          }
+
+          $qemuPath = $qemuImg.Source
+          if (-not $qemuPath) {
+            $qemuPath = $qemuImg.FullName
+          }
+
+          "QEMU_IMG=$qemuPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "QEMU encontrado: $qemuPath"
+          & $qemuPath --version
+
+      - name: Baixar e validar a ISO
+        shell: pwsh
         run: |
-          set -euo pipefail
-          cd "$HOME/garuda-vm"
+          $ErrorActionPreference = "Stop"
 
-          if [ -e /dev/kvm ]; then
-            ACCEL=( -enable-kvm )
-          else
-            ACCEL=()
-          fi
+          $isoPath = Join-Path $env:RUNNER_TEMP "Windows11_x64.iso"
 
-          qemu-system-x86_64 \
-            "${ACCEL[@]}" \
-            -machine q35 \
-            -cpu max \
-            -smp 4 \
-            -m 4096 \
-            -drive file=garuda.qcow2,if=virtio,format=qcow2 \
-            -device virtio-vga \
-            -netdev user,id=net0,hostfwd=tcp:127.0.0.1:3389-:3389 \
-            -device virtio-net-pci,netdev=net0 \
-            -display none \
-            -monitor none \
-            -serial file:garuda-serial.log \
-            -daemonize \
-            -pidfile qemu.pid
+          Write-Host "Iniciando download da ISO..."
+          try {
+            Invoke-WebRequest `
+              -Uri $env:WINDOWS_ISO_URL `
+              -OutFile $isoPath `
+              -UseBasicParsing
+          }
+          catch {
+            throw "Download falhou. O link pode ter expirado ou exigir seleção de idioma. Detalhe: $($_.Exception.Message)"
+          }
 
-          echo "VM iniciada. Aguardando o XRDP..."
-          for i in $(seq 1 60); do
-            if timeout 2 bash -c \
-              '</dev/tcp/127.0.0.1/3389' 2>/dev/null; then
-              echo "Porta XRDP acessível no host."
-              exit 0
-            fi
-            sleep 5
-          done
+          if (-not (Test-Path $isoPath)) {
+            throw "O arquivo ISO não foi criado."
+          }
 
-          echo "::error::XRDP não respondeu. Verifique se está instalado e ativo dentro da imagem Garuda."
-          cat garuda-serial.log || true
-          exit 1
+          $sizeGB = (Get-Item $isoPath).Length / 1GB
+          Write-Host "Tamanho recebido: $([math]::Round($sizeGB, 2)) GB"
 
-      - name: Abrir túnel TCP Pinggy
-        shell: bash
+          if ($sizeGB -lt 1) {
+            throw "Arquivo pequeno demais para ser uma ISO completa do Windows 11."
+          }
+
+          $signature = Get-FileHash -Path $isoPath -Algorithm SHA256
+          Write-Host "SHA256: $($signature.Hash)"
+
+          "WINDOWS_ISO_PATH=$isoPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Criar disco virtual expansível de 80 GB
+        shell: pwsh
         run: |
-          set -euo pipefail
+          $ErrorActionPreference = "Stop"
 
-          echo "Iniciando túnel TCP para a porta XRDP 3389..."
-          echo "O endereço público será exibido pelo Pinggy."
-          echo "Use no Windows App o host e a porta informados pelo túnel."
+          $diskPath = Join-Path $env:RUNNER_TEMP "ExtNoBrasil_Windows11.qcow2"
 
-          ssh -T -p 443 \
-            -o StrictHostKeyChecking=no \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=3 \
-            -o ExitOnForwardFailure=yes \
-            -R 0:127.0.0.1:3389 \
-            tcp@free.pinggy.io
-            
+          if (Test-Path $diskPath) {
+            Remove-Item $diskPath -Force
+          }
+
+          & $env:QEMU_IMG create -f qcow2 $diskPath 80G
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao criar o disco virtual."
+          }
+
+          & $env:QEMU_IMG info $diskPath
+
+          "WINDOWS_DISK_PATH=$diskPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verificar suporte de virtualização
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "Verificando recursos reportados pelo host..."
+
+          try {
+            Get-CimInstance Win32_Processor |
+              Select-Object Name, VirtualizationFirmwareEnabled,
+                VMMonitorModeExtensions,
+                SecondLevelAddressTranslationExtensions |
+              Format-List
+          }
+          catch {
+            Write-Host "Não foi possível consultar todas as propriedades."
+          }
+
+          Write-Host "Essas informações não garantem que QEMU possa usar aceleração."
+
+      - name: Relatório final
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host " ExtNoBrasil PC Virtual [BETA]"
+          Write-Host "========================================"
+          Write-Host "SO pretendido: Windows 11 x64"
+          Write-Host "vCPUs pretendidas: 4"
+          Write-Host "RAM pretendida: 4096 MB"
+          Write-Host "Disco pretendido: 80 GB expansível"
+          Write-Host "Vídeo: não configurado / sem GPU física garantida"
+          Write-Host "Acesso remoto: não configurado"
+          Write-Host ""
+          Write-Host "Este workflow prepara arquivos temporários."
+          Write-Host "Ele não instala nem inicia uma VM utilizável."
+          Write-Host "O disco e a ISO serão perdidos quando o runner for descartado."
+          
