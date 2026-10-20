@@ -1,248 +1,185 @@
+# RDP em runner Windows via Tailscale (a porta 3389 não fica exposta na internet).
+#
+# Secrets do repositório:
+#   TAILSCALE_AUTH_KEY  obrigatório; gere a chave como reusable + ephemeral
+#   RDP_PASSWORD        opcional; senha forte. Sem ela, uma senha aleatória é gerada e mostrada no log
+#
+# Para encerrar e salvar o checkpoint: ícone "Encerrar e salvar" na área de trabalho remota.
 
-name: "ExtNoBrasil PC Virtual - Windows 11"
+name: RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      idle_minutes:
+        description: Encerrar após X min sem ninguém conectado
+        default: "30"
+      persist:
+        description: Restaurar e salvar checkpoint do perfil (só em repo privado)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
+# Uma sessão por vez: a próxima espera a anterior terminar de salvar o checkpoint.
 concurrency:
-  group: extnobrasil-pc-virtual
+  group: rdp
   cancel-in-progress: false
 
 jobs:
-  prepare-vm:
-    name: Preparar ambiente Windows 11 QEMU
+  rdp:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 360 # máximo de um job em runner hospedado pelo GitHub (6h)
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RDP_USER: Skyro
+      IDLE_MIN: ${{ inputs.idle_minutes || '30' }}
+      PERSIST: ${{ inputs.persist && github.event.repository.private }}
+      PERSIST_DIRS: 'Desktop,Documents,Downloads,Pictures,Videos,Music,AppData\Roaming'
+      STATE: 'C:\rdp-state'
+      STOP_FLAG: 'C:\Users\Public\stop.flag'
 
     steps:
-      - name: Exibir informações reais do runner
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+      - name: Conectar ao Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: gh-runner-${{ github.run_id }}
+          version: latest
+          args: --unattended
 
-          Write-Host "========================================"
-          Write-Host " ExtNoBrasil PC Virtual [BETA]"
-          Write-Host " Criador - ExtNoBrasil (ExT)"
-          Write-Host "========================================"
-
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version, OSArchitecture,
-              @{N="RAM_Total_GB";E={[math]::Round($_.TotalVisibleMemorySize / 1MB, 2)}} |
-            Format-List
-
-          Get-CimInstance Win32_Processor |
-            Select-Object Name, NumberOfCores,
-              NumberOfLogicalProcessors |
-            Format-List
-
-          Get-PSDrive -Name C |
-            Select-Object Name,
-              @{N="Livre_GB";E={[math]::Round($_.Free / 1GB, 2)}} |
-            Format-List
-
-          Write-Host "Os dados acima descrevem o runner, não a VM."
-
-      - name: Verificar espaço disponível
-        shell: pwsh
-        run: |
-          $free = (Get-PSDrive C).Free / 1GB
-          Write-Host "Espaço livre: $([math]::Round($free, 2)) GB"
-
-          if ($free -lt 25) {
-            throw "Espaço insuficiente para tentar baixar e preparar a ISO."
-          }
-
-      - name: Tentar obter URL da ISO oficial da Microsoft
-        id: iso
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $page = "https://www.microsoft.com/pt-br/software-download/windows11"
-
-          Write-Host "Consultando a página oficial da Microsoft..."
-          $response = Invoke-WebRequest `
-            -Uri $page `
-            -UseBasicParsing `
-            -Headers @{
-              "User-Agent" = "Mozilla/5.0"
-              "Accept-Language" = "pt-BR,pt;q=0.9,en;q=0.8"
-            }
-
-          $html = $response.Content
-
-          # Só aceita candidatos do domínio de download da Microsoft.
-          $matches = [regex]::Matches(
-            $html,
-            '(?i)https://software\.download\.prss\.microsoft\.com/[^"''\s<>\\]+'
-          )
-
-          $candidate = $null
-
-          foreach ($match in $matches) {
-            $url = [System.Net.WebUtility]::HtmlDecode($match.Value)
-            $url = $url -replace '\\u0026', '&' -replace '&amp;', '&'
-
-            if ($url -match '(?i)\.iso([?&]|$)') {
-              $candidate = $url
-              break
-            }
-          }
-
-          if (-not $candidate) {
-            throw @"
-          A página oficial não revelou uma URL direta da ISO nesta consulta.
-          A Microsoft pode exigir a seleção da edição e do idioma por um fluxo
-          dinâmico. O workflow não usará fontes de terceiros nem inventará URLs.
-          Abra a página oficial:
-          https://www.microsoft.com/pt-br/software-download/windows11
-          "@
-          }
-
-          if ($candidate -notmatch '^https://software\.download\.prss\.microsoft\.com/') {
-            throw "A URL não passou na validação do domínio."
-          }
-
-          "WINDOWS_ISO_URL=$candidate" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          Write-Host "URL oficial candidata encontrada."
-          Write-Host "O link pode expirar; será validado no download."
-
-      - name: Instalar QEMU
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (-not (Get-Command qemu-img.exe -ErrorAction SilentlyContinue)) {
-            choco install qemu -y --no-progress
-          }
-
-          $qemuImg = Get-Command qemu-img.exe -ErrorAction SilentlyContinue
-
-          if (-not $qemuImg) {
-            $possible = @(
-              "C:\Program Files\qemu\qemu-img.exe",
-              "C:\Program Files\QEMU\qemu-img.exe"
-            )
-
-            foreach ($path in $possible) {
-              if (Test-Path $path) {
-                $qemuImg = Get-Item $path
-                break
-              }
-            }
-          }
-
-          if (-not $qemuImg) {
-            throw "Não foi possível localizar qemu-img.exe após a instalação."
-          }
-
-          $qemuPath = $qemuImg.Source
-          if (-not $qemuPath) {
-            $qemuPath = $qemuImg.FullName
-          }
-
-          "QEMU_IMG=$qemuPath" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          Write-Host "QEMU encontrado: $qemuPath"
-          & $qemuPath --version
-
-      - name: Baixar e validar a ISO
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $isoPath = Join-Path $env:RUNNER_TEMP "Windows11_x64.iso"
-
-          Write-Host "Iniciando download da ISO..."
-          try {
-            Invoke-WebRequest `
-              -Uri $env:WINDOWS_ISO_URL `
-              -OutFile $isoPath `
-              -UseBasicParsing
-          }
-          catch {
-            throw "Download falhou. O link pode ter expirado ou exigir seleção de idioma. Detalhe: $($_.Exception.Message)"
-          }
-
-          if (-not (Test-Path $isoPath)) {
-            throw "O arquivo ISO não foi criado."
-          }
-
-          $sizeGB = (Get-Item $isoPath).Length / 1GB
-          Write-Host "Tamanho recebido: $([math]::Round($sizeGB, 2)) GB"
-
-          if ($sizeGB -lt 1) {
-            throw "Arquivo pequeno demais para ser uma ISO completa do Windows 11."
-          }
-
-          $signature = Get-FileHash -Path $isoPath -Algorithm SHA256
-          Write-Host "SHA256: $($signature.Hash)"
-
-          "WINDOWS_ISO_PATH=$isoPath" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Criar disco virtual expansível de 80 GB
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $diskPath = Join-Path $env:RUNNER_TEMP "ExtNoBrasil_Windows11.qcow2"
-
-          if (Test-Path $diskPath) {
-            Remove-Item $diskPath -Force
-          }
-
-          & $env:QEMU_IMG create -f qcow2 $diskPath 80G
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Falha ao criar o disco virtual."
-          }
-
-          & $env:QEMU_IMG info $diskPath
-
-          "WINDOWS_DISK_PATH=$diskPath" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Verificar suporte de virtualização
-        shell: pwsh
+      - name: Restaurar checkpoint
+        if: ${{ env.PERSIST == 'true' }}
         continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.STATE }}
+          key: rdp-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: rdp-state-
+
+      - name: Configurar e liberar RDP
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          Write-Host "Verificando recursos reportados pelo host..."
+          $user = $env:RDP_USER
+          $prof = "C:\Users\$user"
 
-          try {
-            Get-CimInstance Win32_Processor |
-              Select-Object Name, VirtualizationFirmwareEnabled,
-                VMMonitorModeExtensions,
-                SecondLevelAddressTranslationExtensions |
-              Format-List
+          # Senha: secret RDP_PASSWORD ou gerada (24 caracteres, RNG criptográfico)
+          $pw = $env:RDP_PASSWORD
+          $generated = [string]::IsNullOrEmpty($pw)
+          if ($generated) {
+            $chars = [char[]]'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%*?-_'
+            do {
+              $pw = -join (1..24 | ForEach-Object { $chars[[Security.Cryptography.RandomNumberGenerator]::GetInt32(0, $chars.Length)] })
+            } until ($pw -cmatch '[a-z]' -and $pw -cmatch '[A-Z]' -and $pw -match '\d' -and $pw -match '[^a-zA-Z\d]')
           }
-          catch {
-            Write-Host "Não foi possível consultar todas as propriedades."
+
+          # Usuário administrador
+          $secure = ConvertTo-SecureString $pw -AsPlainText -Force
+          New-LocalUser -Name $user -Password $secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Administrators' -Member $user
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $user
+
+          # Checkpoint: cria o perfil do usuário e restaura os arquivos salvos
+          if ($env:PERSIST -eq 'true' -and (Test-Path $env:STATE)) {
+            try {
+              Add-Type -Namespace Win -Name Prof -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int CreateProfile(string sid, string name, System.Text.StringBuilder path, uint len);'
+              $sid = (Get-LocalUser -Name $user).SID.Value
+              $hr = [Win.Prof]::CreateProfile($sid, $user, [Text.StringBuilder]::new(260), 260)
+              if ($hr -ne 0 -and $hr -ne -2147024713) { throw ('CreateProfile falhou: 0x{0:X8}' -f $hr) }
+              foreach ($d in $env:PERSIST_DIRS -split ',') {
+                if (Test-Path "$env:STATE\$d") {
+                  robocopy "$env:STATE\$d" "$prof\$d" /E /XJ /R:0 /W:0 /NFL /NDL /NJH /NJS /NP | Out-Null
+                }
+              }
+              Write-Host 'Checkpoint restaurado.'
+            } catch { Write-Warning "Checkpoint não restaurado: $_" }
           }
 
-          Write-Host "Essas informações não garantem que QEMU possa usar aceleração."
+          # RDP com NLA + TLS; firewall liberado só para a rede do Tailscale
+          $reg = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $reg -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path "$reg\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+          Set-ItemProperty -Path "$reg\WinStations\RDP-Tcp" -Name SecurityLayer -Value 2
+          foreach ($p in 'TCP', 'UDP') {
+            New-NetFirewallRule -DisplayName "RDP-Tailscale-$p" -Direction Inbound -Action Allow -Protocol $p -LocalPort 3389 -RemoteAddress 100.64.0.0/10 | Out-Null
+          }
+          Restart-Service -Name TermService -Force
 
-      - name: Relatório final
-        if: always()
-        shell: pwsh
+          # Atalho "Encerrar e salvar" na área de trabalho
+          Set-Content -Path 'C:\Users\Public\Desktop\Encerrar e salvar.bat' -Value "@echo off`r`ntype nul > $env:STOP_FLAG"
+
+          # IP do Tailscale e teste da porta
+          $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+          if (-not $tsExe) { $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe" }
+          $ip = $null
+          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+            $ip = & $tsExe ip -4 2>$null | Select-Object -First 1
+            if (-not $ip) { Start-Sleep -Seconds 3 }
+          }
+          if (-not $ip) { throw 'Tailscale não recebeu IP.' }
+
+          $ok = $false
+          for ($i = 0; $i -lt 10 -and -not $ok; $i++) {
+            $ok = Test-NetConnection -ComputerName $ip -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+            if (-not $ok) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ok) { throw 'Porta 3389 inacessível.' }
+
+          $node = "gh-runner-$env:GITHUB_RUN_ID"
+          Write-Host ''
+          Write-Host '=== ACESSO RDP ==='
+          Write-Host "Endereço: $ip (ou $node, com MagicDNS)"
+          Write-Host "Usuário:  $user"
+          Write-Host ('Senha:    ' + $(if ($generated) { $pw } else { '(secret RDP_PASSWORD)' }))
+          Write-Host '=================='
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**RDP:** $ip - usuário **$user**"
+          $global:LASTEXITCODE = 0
+
+      - name: Manter sessão (encerra se ficar ocioso)
         run: |
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host " ExtNoBrasil PC Virtual [BETA]"
-          Write-Host "========================================"
-          Write-Host "SO pretendido: Windows 11 x64"
-          Write-Host "vCPUs pretendidas: 4"
-          Write-Host "RAM pretendida: 4096 MB"
-          Write-Host "Disco pretendido: 80 GB expansível"
-          Write-Host "Vídeo: não configurado / sem GPU física garantida"
-          Write-Host "Acesso remoto: não configurado"
-          Write-Host ""
-          Write-Host "Este workflow prepara arquivos temporários."
-          Write-Host "Ele não instala nem inicia uma VM utilizável."
-          Write-Host "O disco e a ISO serão perdidos quando o runner for descartado."
-          
+          $limit = [int]$env:IDLE_MIN * 60
+          $used = Join-Path $env:RUNNER_TEMP 'rdp-used'
+          $end = (Get-Date).AddMinutes(330) # folga para salvar o checkpoint antes do limite de 6h
+          $idle = 0
+          $was = $false
+          while ($idle -lt $limit -and (Get-Date) -lt $end -and -not (Test-Path $env:STOP_FLAG)) {
+            Start-Sleep -Seconds 30
+            $conn = [bool](Get-NetTCPConnection -LocalPort 3389 -State Established -ErrorAction SilentlyContinue)
+            if ($conn) {
+              $idle = 0
+              New-Item -Path $used -ItemType File -Force | Out-Null
+            } else {
+              $idle += 30
+            }
+            if ($conn -ne $was) {
+              Write-Host ('[{0:HH:mm}] RDP {1}' -f (Get-Date), $(if ($conn) { 'conectado' } else { 'desconectado' }))
+              $was = $conn
+            }
+          }
+          Write-Host 'Encerrando sessão.'
+
+      - name: Preparar checkpoint
+        if: ${{ always() && env.PERSIST == 'true' }}
+        run: |
+          $used = Join-Path $env:RUNNER_TEMP 'rdp-used'
+          if (-not (Test-Path $used)) { Write-Host 'Ninguém conectou; checkpoint anterior mantido.'; exit 0 }
+          $prof = "C:\Users\$env:RDP_USER"
+          foreach ($d in $env:PERSIST_DIRS -split ',') {
+            if (Test-Path "$prof\$d") {
+              robocopy "$prof\$d" "$env:STATE\$d" /MIR /XJ /R:0 /W:0 /NFL /NDL /NJH /NJS /NP /XD "$prof\AppData\Roaming\Microsoft" | Out-Null
+            }
+          }
+          'SAVE_CHECKPOINT=1' >> $env:GITHUB_ENV
+          $global:LASTEXITCODE = 0
+
+      - name: Salvar checkpoint
+        if: ${{ always() && env.SAVE_CHECKPOINT == '1' }}
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.STATE }}
+          key: rdp-state-${{ github.run_id }}-${{ github.run_attempt }}
